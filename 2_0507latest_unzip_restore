@@ -1,1 +1,72 @@
-#test
+# Load AWS PowerShell Module
+Import-Module AWSPowerShell
+
+# Define variables
+$bucketName = "ScheduleBase_Bucket"
+$databaseFolder = "C:\Database"
+$restoreFilePattern = "*latest*.zip"
+$tempFolder = "$databaseFolder\temp"
+$s3UploadFolder = "Database/sbtemp/"
+$dbInstanceName = "ScheduleBaseDB"
+$s3BackupFileName = "latest_restore.bak"
+$dbBackupFileName = "$databaseFolder\latest_restore.bak"
+
+# Create local folders if they don't exist
+if (-Not (Test-Path -Path $databaseFolder)) {
+    New-Item -ItemType Directory -Path $databaseFolder
+}
+
+if (-Not (Test-Path -Path $tempFolder)) {
+    New-Item -ItemType Directory -Path $tempFolder
+}
+
+# Download the latest zip file matching the pattern from S3
+$latestZipFile = Get-S3Object -BucketName $bucketName -KeyPrefix "Database/" | 
+    Where-Object { $_.Key -like $restoreFilePattern } | 
+    Sort-Object LastModified -Descending | 
+    Select-Object -First 1
+
+if ($null -eq $latestZipFile) {
+    Write-Host "No zip file matching the pattern found in the S3 bucket."
+    exit
+}
+
+$localZipFilePath = "$databaseFolder\$($latestZipFile.Key -split '/' | Select-Object -Last 1)"
+Read-S3Object -BucketName $bucketName -Key $latestZipFile.Key -File $localZipFilePath
+
+# Unzip the downloaded file
+Expand-Archive -Path $localZipFilePath -DestinationPath $tempFolder
+
+# Find the .bak file in the unzipped folder
+$bakFilePath = Get-ChildItem -Path $tempFolder -Filter "*.bak" | Select-Object -First 1
+
+if ($null -eq $bakFilePath) {
+    Write-Host "No .bak file found in the unzipped folder."
+    exit
+}
+
+# Upload the .bak file to the S3 bucket
+Write-S3Object -BucketName $bucketName -File $bakFilePath.FullName -Key "$s3UploadFolder$($bakFilePath.Name)"
+
+# Download the .bak file from the S3 bucket to the local database folder
+aws s3 cp "s3://$bucketName/$s3UploadFolder$($bakFilePath.Name)" "$dbBackupFileName"
+
+# Restore the database using SQL Server
+$serverInstance = "localhost" # Change this to your SQL Server instance name if necessary
+$restoreSql = @"
+RESTORE DATABASE [$dbInstanceName]
+FROM DISK = N'$dbBackupFileName'
+WITH FILE = 1,  
+MOVE N'ScheduleBaseDB_Data' TO N'C:\Program Files\Microsoft SQL Server\MSSQL15.MSSQLSERVER\MSSQL\DATA\ScheduleBaseDB.mdf',  
+MOVE N'ScheduleBaseDB_Log' TO N'C:\Program Files\Microsoft SQL Server\MSSQL15.MSSQLSERVER\MSSQL\DATA\ScheduleBaseDB_log.ldf',  
+NOUNLOAD,  
+STATS = 5
+"@
+
+Invoke-Sqlcmd -ServerInstance $serverInstance -Query $restoreSql
+
+# Clean up
+Remove-Item -Path $localZipFilePath
+Remove-Item -Path $tempFolder -Recurse
+
+Write-Host "Database restore process completed successfully!"
