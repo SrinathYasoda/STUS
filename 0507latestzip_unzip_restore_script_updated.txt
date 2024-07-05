@@ -1,0 +1,67 @@
+# Import required modules
+Import-Module AWSPowerShell
+Import-Module SqlServer
+
+# Set variables
+$awsAccessKeyID = "your-access-key-id"
+$awsSecretAccessKeyID = "your-secret-access-key"
+$region = "your-region"
+$bucketName = "ScheduleBase_Bucket"
+$s3SourceFolder = "Database/"
+$s3TempFolder = "Database/sbtemp/"
+$localBackupDir = "C:\ScheduleBase\DatabaseRestore\"
+$ziplibLocation = "C:\path\to\DotNetZip.dll"  # Update path to DotNetZip library
+$dbName = "ScheduleBaseDB"
+$dbServer = "localhost"  # Assuming the script runs on the same EC2 instance
+$filePattern = "*.zip"
+
+# Ensure the local backup directory exists
+if (-not (Test-Path -Path $localBackupDir)) {
+    New-Item -Path $localBackupDir -ItemType Directory | Out-Null
+}
+
+# Step 1: Download the latest restore zip file from S3
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$latestFile = Get-S3Object -BucketName $bucketName -KeyPrefix $s3SourceFolder -AccessKey $awsAccessKeyID -SecretKey $awsSecretAccessKeyID | Where-Object { $_.Key -like $filePattern } | Sort-Object LastModified -Descending | Select-Object -First 1
+
+if ($latestFile) {
+    $localZipFile = Join-Path $localBackupDir (Split-Path -Leaf $latestFile.Key)
+    Write-Host "Downloading the latest file: $($latestFile.Key) to $localZipFile"
+    Read-S3Object -BucketName $bucketName -Key $latestFile.Key -File $localZipFile -AccessKey $awsAccessKeyID -SecretKey $awsSecretAccessKeyID
+
+    # Step 2: Unzip the file to extract the .bak file
+    Add-Type -Path $ziplibLocation
+    $zipfile = [Ionic.Zip.ZipFile]::Read($localZipFile)
+    $zipfile.ExtractAll($localBackupDir, [Ionic.Zip.ExtractExistingFileAction]::OverwriteSilently)
+    $zipfile.Dispose()
+
+    # Get the extracted .bak file
+    $bakFile = Get-ChildItem -Path $localBackupDir -Filter *.bak | Select-Object -First 1
+
+    if ($bakFile) {
+        # Upload the .bak file to the S3 temp folder
+        $s3BakFileKey = $s3TempFolder + $bakFile.Name
+        Write-Host "Uploading $($bakFile.FullName) to s3://$bucketName/$s3BakFileKey"
+        Write-S3Object -BucketName $bucketName -File $bakFile.FullName -Key $s3BakFileKey -AccessKey $awsAccessKeyID -SecretKey $awsSecretAccessKeyID
+
+        # Step 3: Restore the database from the .bak file
+        $restoreFilePath = "C:\$($bakFile.Name)"
+        Read-S3Object -BucketName $bucketName -Key $s3BakFileKey -File $restoreFilePath -AccessKey $awsAccessKeyID -SecretKey $awsSecretAccessKeyID
+
+        $restoreSql = @"
+USE [master];
+ALTER DATABASE [$dbName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+RESTORE DATABASE [$dbName] FROM DISK = '$restoreFilePath' WITH REPLACE;
+ALTER DATABASE [$dbName] SET MULTI_USER;
+"@
+
+        # Execute the restore script on the SQL Server
+        Write-Host "Restoring the database [$dbName] from $restoreFilePath"
+        Invoke-Sqlcmd -ServerInstance $dbServer -Query $restoreSql
+        Write-Host "Database [$dbName] restored successfully."
+    } else {
+        Write-Host "No .bak file found in the extracted zip file."
+    }
+} else {
+    Write-Host "No files found matching the pattern '$filePattern' in the bucket '$bucketName'."
+}
